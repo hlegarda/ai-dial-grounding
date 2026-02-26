@@ -1,12 +1,17 @@
 import asyncio
+import os
 from typing import Any
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_openai import AzureChatOpenAI
+from openai import APIError, APIStatusError
 from pydantic import SecretStr
 from task._constants import DIAL_URL, API_KEY
 from task.user_client import UserClient
 
-#TODO:
+# Optional env: AZURE_OPENAI_CHAT_DEPLOYMENT, AZURE_OPENAI_API_VERSION (e.g. if you get "No route")
+_CHAT_DEPLOYMENT = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "gpt-4")
+_CHAT_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "")
+
 # Before implementation open the `flow_diagram.png` to see the flow of app
 
 BATCH_SYSTEM_PROMPT = """You are a user search assistant. Your task is to find users from the provided list that match the search criteria.
@@ -54,61 +59,91 @@ class TokenTracker:
             'batch_tokens': self.batch_tokens
         }
 
-#TODO:
-# 1. Create AzureChatOpenAI client
-#    hint: api_version set as empty string if you gen an error that indicated that api_version cannot be None
-# 2. Create TokenTracker
+llm_client = AzureChatOpenAI(
+    azure_endpoint=DIAL_URL,
+    api_key=SecretStr(API_KEY),
+    azure_deployment=_CHAT_DEPLOYMENT,
+    api_version=_CHAT_API_VERSION or "",
+)
+token_tracker = TokenTracker()
+
 
 def join_context(context: list[dict[str, Any]]) -> str:
-    #TODO:
-    # You cannot pass raw JSON with user data to LLM (" sign), collect it in just simple string or markdown.
-    # You need to collect it in such way:
-    # User:
-    #   name: John
-    #   surname: Doe
-    #   ...
-    raise NotImplementedError
+    parts = []
+    for user in context:
+        lines = ["User:"]
+        for key, value in user.items():
+            lines.append(f"  {key}: {value}")
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts)
 
 
-async def generate_response(system_prompt: str, user_message: str) -> str:
-    print("Processing...")
-    #TODO:
-    # 1. Create messages array with system prompt and user message
-    # 2. Generate response (use `ainvoke`, don't forget to `await` the response)
-    # 3. Get usage (hint, usage can be found in response metadata (its dict) and has name 'token_usage', that is also
-    #    dict and there you need to get 'total_tokens')
-    # 4. Add tokens to `token_tracker`
-    # 5. Print response content and `total_tokens`
-    # 5. return response content
-    raise NotImplementedError
+async def generate_response(system_prompt: str, user_message: str, *, quiet: bool = False) -> str:
+    if not quiet:
+        print("Processing...")
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_message),
+    ]
+    try:
+        response = await llm_client.ainvoke(messages)
+    except (APIError, APIStatusError) as e:
+        print(
+            f"LLM request failed: {e}. "
+            "Check DIAL_API_KEY is set, you are on VPN if required, and the DIAL endpoint is available."
+        )
+        raise
+    usage = response.response_metadata.get("token_usage", {})
+    total_tokens = usage.get("total_tokens", 0)
+    token_tracker.add_tokens(total_tokens)
+    content = response.content if isinstance(response.content, str) else ""
+    if not quiet:
+        print(content)
+        print(f"total_tokens: {total_tokens}")
+    return content
 
 
 async def main():
     print("Query samples:")
     print(" - Do we have someone with name John that loves traveling?")
 
-    user_question = input("> ").strip()
+    user_question = (await asyncio.to_thread(input, "> ")).strip()
     if user_question:
         print("\n--- Searching user database ---")
 
-        #TODO:
-        # 1. Get all users (use UserClient)
-        # 2. Split all users on batches (100 users in 1 batch). We need it since LLMs have its limited context window
-        # 3. Prepare tasks for async run of response generation for users batches:
-        #       - create array tasks
-        #       - iterate through `user_batches` and call `generate_response` with these params:
-        #           - BATCH_SYSTEM_PROMPT (system prompt)
-        #           - User prompt, you need to format USER_PROMPT with context from user batch and user question
-        # 4. Run task asynchronously, use method `gather` form `asyncio`
-        # 5. Filter results on 'NO_MATCHES_FOUND' (see instructions for BATCH_SYSTEM_PROMPT)
-        # 5. If results after filtration are present:
-        #       - combine filtered results with "\n\n" spliterator
-        #       - generate response with such params:
-        #           - FINAL_SYSTEM_PROMPT (system prompt)
-        #           - User prompt: you need to make augmentation of retrieved result and user question
-        # 6. Otherwise prin the info that `No users found matching`
-        # 7. In the end print info about usage, you will be impressed of how many tokens you have used. (imagine if we have 10k or 100k users 😅)
-    raise NotImplementedError
+        user_client = UserClient()
+        all_users = user_client.get_all_users()
+
+        batch_size = 100
+        user_batches = [
+            all_users[i : i + batch_size]
+            for i in range(0, len(all_users), batch_size)
+        ]
+
+        num_batches = len(user_batches)
+        print(f"Processing {num_batches} batches in parallel...")
+        tasks = [
+            generate_response(
+                BATCH_SYSTEM_PROMPT,
+                USER_PROMPT.format(context=join_context(batch), query=user_question),
+                quiet=True,
+            )
+            for batch in user_batches
+        ]
+        results = await asyncio.gather(*tasks)
+
+        filtered = [r for r in results if r.strip() != "NO_MATCHES_FOUND"]
+
+        if filtered:
+            combined = "\n\n".join(filtered)
+            await generate_response(
+                FINAL_SYSTEM_PROMPT,
+                USER_PROMPT.format(context=combined, query=user_question),
+            )
+        else:
+            print("No users found matching")
+
+        print("Token usage summary:", token_tracker.get_summary())
 
 
 if __name__ == "__main__":
